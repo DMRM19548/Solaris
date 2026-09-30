@@ -3,6 +3,8 @@ import {Sound} from './audio.js';
 const canvas=document.querySelector('canvas'),ctx=canvas.getContext('2d');
 const entry=document.querySelector('#entry'),button=entry.querySelector('button'),error=document.querySelector('#error');
 const clock=new WorldClock(),sound=new Sound(()=>clock.now());
+// Begin the small state request while the entry word is still visible.
+let preparedWorld=loadWorld(clock).catch(()=>null);
 // Discard obsolete private snapshots; the site's shared history is authoritative.
 try {
  const prefix='solaris-b:v1:'+new URL('.',location.href).pathname+':';
@@ -12,6 +14,8 @@ let worker,state,entered=false,busy=false,ready=false,latestLines,latestPatch,la
 let grid=innerWidth<600?160:224,slow=0;
 const dev=new URLSearchParams(location.search).has('dev');
 const fail=e=>{
+ clearTimeout(renderTimer);worker?.terminate();worker=null;state=null;ready=false;busy=false;entered=false;
+ sound.stop();preparedWorld=Promise.resolve(null);
  console.error(e);error.textContent=e.message||String(e);entry.classList.remove('gone');entry.hidden=false;entry.inert=false;
  button.disabled=false;button.textContent='SOLARIS';
 };
@@ -48,9 +52,14 @@ async function start() {
  button.disabled=true;error.textContent='';
  try {
   // The click only opens observation and audio; it never changes the world's birth.
-  const audioReady=sound.unlock();
+  // Audio download/decode must never hold the first visual frame hostage.
+  sound.unlock().then(()=>{
+   if(!document.hidden&&entered)sound.sync(latestAudio,true);
+  }).catch(e=>console.warn('Solaris audio:',e));
+  entered=true;
   if(!state) {
-   const [{world,state:sharedState}]=await Promise.all([loadWorld(clock),audioReady]);
+   const {world,state:sharedState,maxAdvance}=await preparedWorld||await loadWorld(clock);
+   preparedWorld=Promise.resolve(null);
    state=sharedState;
    worker=new Worker(new URL('./worker.js',import.meta.url),{type:'module'});
    worker.onerror=fail;
@@ -75,9 +84,9 @@ async function start() {
     if(data.duration>90&&grid>128&&++slow>=5){grid-=32;slow=0;}
     renderTimer=setTimeout(requestFrame,Math.max(0,50-data.duration));
    };
-   worker.postMessage({type:'init',state,world});
+   worker.postMessage({type:'init',state,world,maxAdvance});
   }
-  await audioReady;entered=true;requestFrame();
+  requestFrame();
  } catch(e){fail(e);}
 }
 button.addEventListener('click',start);

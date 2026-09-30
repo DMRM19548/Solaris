@@ -1,25 +1,26 @@
 import {T,advance,interpolate,validState} from './law.js';
 import {project} from './contours.js';
-import {checkpointGeneration,readCheckpoint} from './world.js';
-let state,transition,world,attempted=-1;
+import {loadWorld} from './world.js';
+let state,transition,world,maxAdvance=15;
 self.onmessage=async({data})=>{
  try {
   if(data.type==='init') {
    if(!validState(data.state)) throw Error('Invalid world state.');
-   state=data.state;world=data.world;transition=advance(state);self.postMessage({type:'ready'});return;
+   state=data.state;world=data.world;maxAdvance=data.maxAdvance??15;
+   transition=advance(state);self.postMessage({type:'ready'});return;
   }
   if(data.type!=='frame'||!state) return;
   if(data.now<state.t0) {self.postMessage({type:'dormant',wait:state.t0-data.now});return;}
   const age=Math.max(0,(data.now-state.t0)/1000),target=Math.floor(age/T);
   let checkpoint=null;
-  const n=world?checkpointGeneration(world,data.now):0;
-  if(n>state.n&&n!==attempted) {
-   attempted=n;
-   try {state=await readCheckpoint(world,n);transition=advance(state);checkpoint=state;}
-   catch(e){console.warn(e.message);} // Exact generation advance remains the fallback.
+  if(target-state.n>maxAdvance+1) {
+   // A sleeping tab fetches today's state instead of replaying its absence.
+   const loaded=await loadWorld({now:()=>data.now,synchronize:()=>{}});
+   state=loaded.state;world=loaded.world;maxAdvance=loaded.maxAdvance;
+   transition=advance(state);checkpoint=state;
   }
   const start=performance.now();
-  // Worker catch-up in bounded batches. The UI stays responsive even after years.
+  // The publisher bounds missing generations independently of the world's age.
   while(state.n<target && performance.now()-start<35) {
    state=transition.next;transition=advance(state);checkpoint=state;
   }

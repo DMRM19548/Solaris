@@ -1,0 +1,48 @@
+name: Renew Solaris current state
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - state-anchor.json
+      - current.json
+      - 'solaris-state-*.bin'
+  workflow_dispatch:
+  schedule:
+    - cron: '23 4 * * *'
+permissions:
+  contents: write
+  pages: write
+concurrency:
+  group: solaris-current-state
+  cancel-in-progress: false
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Verify state loading
+        run: node --test startup.test.mjs
+      - name: Prepare exact current states and a fourteen-day reserve
+        run: node build-current.mjs
+      - name: Save the current publication and its advancing anchor
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A -- state-anchor.json current.json ':(glob)solaris-state-*.bin'
+          if ! git diff --cached --quiet; then
+            git commit -m 'Renew Solaris current states'
+            git push origin HEAD:main
+          fi
+      # A GITHUB_TOKEN commit does not itself trigger the ordinary Pages build.
+      # Explicitly request it while retaining the existing main/root Pages source.
+      - name: Publish through the existing GitHub Pages configuration
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --method POST "repos/$GITHUB_REPOSITORY/pages/builds" --silent
