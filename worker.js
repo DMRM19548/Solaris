@@ -15,9 +15,19 @@ self.onmessage=async({data})=>{
   let checkpoint=null;
   if(target-state.n>maxAdvance+1) {
    // A sleeping tab fetches today's state instead of replaying its absence.
-   const loaded=await loadWorld({now:()=>data.now,synchronize:()=>{}});
-   state=loaded.state;world=loaded.world;maxAdvance=loaded.maxAdvance;
-   transition=advance(state);checkpoint=state;
+   try {
+    const loaded=await loadWorld({now:()=>data.now,synchronize:()=>{}});
+    // Do not rewind a live world to a stale publication while catching up.
+    if(loaded.state.n>state.n) {
+     state=loaded.state;transition=advance(state);checkpoint=state;
+    }
+    world=loaded.world;
+   } catch(e) {
+    if(e.code==='SOLARIS_IDENTITY')throw e;
+    // A tab already has a valid exact state, even when the network is down.
+    console.warn(e.message);
+   }
+   maxAdvance=Math.max(15,target-state.n);
   }
   const start=performance.now();
   // The publisher bounds missing generations independently of the world's age.
@@ -25,6 +35,7 @@ self.onmessage=async({data})=>{
    state=transition.next;transition=advance(state);checkpoint=state;
   }
   if(state.n<target) {self.postMessage({type:'catching-up',checkpoint});return;}
+  maxAdvance=15;
   const u=state.n>target?0:(age/T-target);
   const visible=interpolate(state,transition,u);
   const began=performance.now();

@@ -20,43 +20,58 @@ export function checkpointGeneration(world,now) {
 }
 export function checkState(state,world,n) {
  if(!validState(state)||state.seed!==world.seed||state.t0!==world.t0||state.n!==n)
-  throw Error('The Solaris state does not match its world.');
+  throw Object.assign(Error('The Solaris state does not match its world.'),{code:'SOLARIS_IDENTITY'});
  return state;
 }
 export async function readCheckpoint(world,n,fetcher=fetch) {
  if(n===0)return initial(world.seed,world.t0);
  const chunk=Math.floor((n/world.stride-1)/world.chunkSize);
- // Earlier manual uploads also placed these unchanged files in the root.
- for(const path of ['./checkpoints/chunk-'+chunk+'.json','./chunk-'+chunk+'.json']) {
-  const response=await fetcher(url(path));
-  if(response.ok)return checkState((await response.json())[n],world,n);
+ for(const path of ['./chunk-'+chunk+'.json','./checkpoints/chunk-'+chunk+'.json']) {
+  try {
+   const response=await fetcher(url(path));
+   if(response.ok)return checkState((await response.json())[n],world,n);
+  } catch(e) {if(e.code==='SOLARIS_IDENTITY')throw e;}
  }
  throw Error('The shared Solaris state could not be loaded.');
 }
 export async function readCurrentState(world,now,manifest,fetcher=fetch) {
- const target=targetGeneration(world,now);
+ const target=targetGeneration(world,now),candidates=[];
  if(manifest) {
   if(manifest.seed!==world.seed||manifest.t0!==world.t0||manifest.version!==VERSION
    ||manifest.stride!==MAX_FAST_ADVANCE+1||!Number.isSafeInteger(manifest.from)
    ||!Number.isSafeInteger(manifest.through)||manifest.from<0||manifest.through<manifest.from
+   ||manifest.from%manifest.stride!==0||manifest.through%manifest.stride!==0
    ||(manifest.encoding==='gzip-json'
     ?manifest.packSize!==32||!/^solaris-state-[a-f0-9]{16}-$/.test(manifest.prefix)
     :!/^states\/[a-f0-9]{16}\/$/.test(manifest.directory)))
    throw Error('Invalid Solaris current-state manifest.');
-  const n=Math.floor(target/manifest.stride)*manifest.stride;
-  if(n<manifest.from||n>manifest.through)
-   throw Error('The current Solaris state is temporarily unavailable. Please try again later.');
-  const packed=manifest.encoding==='gzip-json';
-  const path=packed?manifest.prefix+Math.floor(n/(manifest.stride*manifest.packSize))+'.bin':manifest.directory+n+'.json';
-  const response=await fetcher(url('./'+path));
-  if(!response.ok)throw Error('The current Solaris state could not be loaded. Please try again.');
-  const value=packed?await new Response(response.body.pipeThrough(new DecompressionStream('gzip'))).json():await response.json();
-  return {state:checkState(packed?value[n]:value,world,n),maxAdvance:MAX_FAST_ADVANCE};
+  const n=Math.min(Math.floor(target/manifest.stride)*manifest.stride,manifest.through);
+  if(n>=manifest.from) candidates.push({n,fast:true,read:async()=>{
+   const packed=manifest.encoding==='gzip-json';
+   const path=packed?manifest.prefix+Math.floor(n/(manifest.stride*manifest.packSize))+'.bin':manifest.directory+n+'.json';
+   const response=await fetcher(url('./'+path));
+   if(!response.ok)throw Error('The compact Solaris state could not be loaded.');
+   const value=packed?await new Response(response.body.pipeThrough(new DecompressionStream('gzip'))).json():await response.json();
+   return checkState(packed?value[n]:value,world,n);
+  }});
  }
- // Compatibility during installation only. Never replay months from birth.
- const n=checkpointGeneration(world,now);
- if(target-n>=world.stride)throw Error('Solaris needs an updated current-state publication.');
- return {state:await readCheckpoint(world,n,fetcher),maxAdvance:world.stride-1};
+ const coarse=checkpointGeneration(world,now);
+ candidates.push({n:coarse,read:()=>readCheckpoint(world,coarse,fetcher)});
+ // A fresh compact state is preferred. If renewal stops, use the nearest exact
+ // surviving checkpoint and advance it to now; expiration never ends the world.
+ candidates.sort((a,b)=>{
+  const freshA=a.fast&&target-a.n<=MAX_FAST_ADVANCE;
+  const freshB=b.fast&&target-b.n<=MAX_FAST_ADVANCE;
+  return Number(freshB)-Number(freshA)||b.n-a.n;
+ });
+ let failure;
+ for(const candidate of candidates) {
+  try {
+   const state=await candidate.read();
+   return {state,maxAdvance:Math.max(MAX_FAST_ADVANCE,target-state.n)};
+  } catch(e) {if(e.code==='SOLARIS_IDENTITY')throw e;failure=e;}
+ }
+ throw failure||Error('Solaris could not load a valid shared state.');
 }
 export async function loadWorld(clock,fetcher=fetch) {
  const began=Date.now();
@@ -64,7 +79,7 @@ export async function loadWorld(clock,fetcher=fetch) {
   if(r.status===404)return null;
   if(!r.ok)throw Error('Solaris could not load its current-state index.');
   return r.json();
- });
+ }).catch(()=>null); // The compact index is an accelerator, not the world's identity.
  const [response,manifest]=await Promise.all([
   fetcher(url('./universe.json'),{cache:'no-cache'}),manifestPromise
  ]);

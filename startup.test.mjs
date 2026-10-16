@@ -25,15 +25,19 @@ test('one small state, at most 15 generations, exact continuous history',async()
   assert.deepEqual(state,states.get(target));
  }
 });
-test('missing current state never triggers a replay from birth',async()=>{
- let requests=0;
- await assert.rejects(readCurrentState(world,when(81),manifest,async()=>{requests++;return json({},404);}));
- assert.equal(requests,1);
+test('missing files never trigger a replay from birth for an established world',async()=>{
+ const urls=[];
+ await assert.rejects(readCurrentState(world,when(world.stride+40),manifest,async url=>{
+  urls.push(url.pathname);return json({},404);
+ }));
+ assert.equal(urls.length,3);
 });
-test('expired publication stops instead of pretending an old state is current',async()=>{
- let requests=0;
- await assert.rejects(readCurrentState(world,when(128),manifest,async()=>{requests++;}));
- assert.equal(requests,0);
+test('expired compact publication continues from its last exact state',async()=>{
+ const loaded=await readCurrentState(world,when(128),manifest,async()=>json(states.get(96)));
+ assert.equal(loaded.state.n,96);assert.equal(loaded.maxAdvance,32);
+ let expected=states.get(96),resumed=loaded.state;
+ while(expected.n<128){expected=advance(expected).next;resumed=advance(resumed).next;}
+ assert.deepEqual(resumed,expected);
 });
 test('a state from another world is rejected',async()=>{
  await assert.rejects(readCurrentState(world,when(81),manifest,async()=>json({...states.get(80),seed:'different'})));
@@ -43,7 +47,7 @@ test('root-uploaded legacy files are supported without changing their contents',
  const chunk=JSON.parse(readFileSync(new URL('./chunk-'+index+'.json',import.meta.url)));
  const state=await readCheckpoint(world,n,async url=>{urls.push(url.pathname);
   return url.pathname.includes('/checkpoints/')?json({},404):json(chunk);});
- assert.equal(urls.length,2);assert.deepEqual(state,chunk[n]);
+ assert.equal(urls.length,1);assert.deepEqual(state,chunk[n]);
 });
 test('loadWorld requests the index and identity, then only the selected state',async()=>{
  const urls=[];
@@ -56,10 +60,11 @@ test('loadWorld requests the index and identity, then only the selected state',a
  assert.equal(loaded.state.n,80);assert.equal(urls.length,3);
  assert.ok(urls.every(url=>!url.includes('chunk-')));
 });
-test('legacy fallback cannot accumulate unbounded replay after its horizon',async()=>{
- await assert.rejects(readCurrentState(world,when(world.through+world.stride),null,async()=>{
-  assert.fail('No history should be fetched');
- }));
+test('original checkpoint horizon is not an expiration date',async()=>{
+ const chunk=JSON.parse(readFileSync(new URL('./chunk-11.json',import.meta.url)));
+ const target=world.through+world.stride;
+ const loaded=await readCurrentState(world,when(target),null,async()=>json(chunk));
+ assert.equal(loaded.state.n,world.through);assert.equal(loaded.maxAdvance,world.stride);
 });
 test('pre-birth observation retains original generation zero',async()=>{
  const result=await readCurrentState(world,world.t0-1000,manifest,async()=>json(states.get(0)));
@@ -80,7 +85,7 @@ test('compressed packs load the same current state with a single small request',
 });
 test('damaged compressed data fails without inventing a replacement world',async()=>{
  const packed={...manifest,encoding:'gzip-json',packSize:32,prefix:'solaris-state-0123456789abcdef-'};
- await assert.rejects(readCurrentState(world,when(80),packed,async()=>new Response('invalid gzip')));
+ await assert.rejects(readCurrentState(world,when(world.stride+40),packed,async url=>url.pathname.endsWith('.bin')?new Response('invalid gzip'):json({},404)));
 });
 
 test('worker resumes a sleeping tab by fetching a bounded current state',async()=>{
@@ -143,4 +148,54 @@ test('first visual frame does not wait for the audio download',async()=>{
  await listeners.click();
  await new Promise(resolve=>setImmediate(resolve));
  assert.ok(classes.has('gone'),'The current image must be shown while audio is still pending');
+});
+
+// Reproduce the real outage using the repository's unchanged September index.
+const localFetch=async url=>{
+ try{return new Response(readFileSync(new URL('./'+url.pathname.split('/').at(-1),import.meta.url)));}
+ catch{return json({},404);}
+};
+test('October 15 opens using original checkpoints when September renewal never ran',async()=>{
+ const old={...world,from:0,through:27120,stride:16,encoding:'gzip-json',packSize:32,prefix:'solaris-state-4473f08c66dae820-'};
+ const now=Date.parse('2026-10-15T13:46:00Z');
+ const target=Math.floor((now-world.t0)/(T*1000));
+ assert.ok(target>old.through);
+ const loaded=await readCurrentState(world,now,old,localFetch);
+ assert.equal(loaded.state.n,Math.floor(target/world.stride)*world.stride);
+ assert.ok(target-loaded.state.n<world.stride);
+ assert.ok(loaded.state.n>old.through);
+});
+test('current index HTTP failure does not block original checkpoint recovery',async()=>{
+ const now=when(world.stride+10);
+ const result=await loadWorld({now:()=>now,synchronize(){}},async url=>
+  url.pathname.endsWith('current.json')?json({},503):localFetch(url));
+ assert.equal(result.state.n,world.stride);
+});
+
+test('worker recovers the actual outage and reaches the current generation',async()=>{
+ const now=Date.parse('2026-10-15T13:46:00Z'),target=Math.floor((now-world.t0)/(T*1000));
+ const worker=new Worker(`
+  const {parentPort,workerData}=require('node:worker_threads');
+  const {readFileSync}=require('node:fs');
+  global.self={postMessage:data=>parentPort.postMessage(data)};
+  global.fetch=async url=>{
+   if(url.pathname.endsWith('current.json'))return new Response(JSON.stringify(workerData.old));
+   try{return new Response(readFileSync(new URL('./'+url.pathname.split('/').at(-1),workerData.url)));}
+   catch{return new Response('{}',{status:404});}
+  };
+  import(workerData.url).then(()=>parentPort.on('message',data=>self.onmessage({data})));
+ `,{eval:true,workerData:{url:new URL('./worker.js',import.meta.url).href,
+ old:{...world,from:0,through:27120,stride:16,encoding:'gzip-json',packSize:32,prefix:'solaris-state-4473f08c66dae820-'}}});
+ const next=()=>new Promise((resolve,reject)=>{worker.once('message',resolve);worker.once('error',reject);});
+ try {
+  let reply=next();worker.postMessage({type:'init',world,state:states.get(16),maxAdvance:15});
+  assert.equal((await reply).type,'ready');
+  let frame;
+  for(let attempts=0;attempts<200;attempts++) {
+   reply=next();worker.postMessage({type:'frame',now,size:32});frame=await reply;
+   if(frame.type!=='catching-up')break;
+  }
+  assert.equal(frame.type,'frame');assert.equal(frame.n,target);
+  assert.equal(frame.audio.t0,world.t0);assert.ok(frame.lines.length>0);
+ }finally{await worker.terminate();}
 });
